@@ -12,6 +12,7 @@
     "dry_run": true,
     "roundtrip_enabled": false,
     "max_trades": 0,
+    "concurrent_wallets": 0,
     "use_max_balance": false,
     "reserve_amount": "0",
     "quote_params": {
@@ -38,8 +39,7 @@
     },
     "max_price_impact_bps": 200,
     "max_network_fee": "1",
-    "min_expected_out": "0",
-    "cooldown_seconds": 120
+    "min_expected_out": "0"
   },
   "logging": {
     "level": "INFO",
