@@ -1,0 +1,14 @@
+.venv/
+.venv312/
+__pycache__/
+*.pyc
+bot.log
+ui_stdout.log
+ui_stderr.log
+.env
+config.json
+wallets.json
+secrets/
+log_archive/
+runtime_gas_gate.json
+runtime_gas_gate.lock

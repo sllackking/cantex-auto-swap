@@ -1,0 +1,33 @@
+loop:
+  interval_seconds: 15
+
+gas:
+  # provider:
+  #   - fixed        : always returns fixed_gwei (for testing)
+  #   - eth_rpc      : fetches gas from JSON-RPC eth_gasPrice
+  provider: eth_rpc
+  max_gwei: 8.0
+  fixed_gwei: 5.0
+  eth_rpc_url: https://rpc.ankr.com/eth
+
+trade:
+  dry_run: true
+  # Fill with the exact fields required by your cantex_sdk's get_swap_quote/swap methods.
+  quote_params:
+    token_in: USDC
+    token_out: CANTO
+    amount_in: "1000000"
+    slippage_bps: 100
+  swap_params:
+    token_in: USDC
+    token_out: CANTO
+    amount_in: "1000000"
+    min_amount_out: "0"
+    slippage_bps: 100
+  # Safety checks before sending swap()
+  max_price_impact_bps: 200
+  min_expected_out: "0"
+
+logging:
+  level: INFO
+  log_file: bot.log
