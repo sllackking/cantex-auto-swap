@@ -30,10 +30,16 @@ if (Test-Path requirements.txt) {
   }
 }
 
-$sdkLocal = Join-Path (Split-Path $PSScriptRoot -Parent) "cantex_sdk"
-$sdkLocalSrc = Join-Path $sdkLocal "src"
-if (Test-Path $sdkLocalSrc) {
-  & $python -m pip install --disable-pip-version-check -e $sdkLocal
+$sdkCandidates = @(
+  (Join-Path $PSScriptRoot "cantex_sdk"),
+  (Join-Path (Split-Path $PSScriptRoot -Parent) "cantex_sdk")
+)
+foreach ($sdkLocal in $sdkCandidates) {
+  $sdkLocalSrc = Join-Path $sdkLocal "src"
+  if (Test-Path $sdkLocalSrc) {
+    & $python -m pip install --disable-pip-version-check -e $sdkLocal
+    break
+  }
 }
 
 # Ensure critical runtime deps exist even if sdk metadata install is incomplete.
@@ -43,7 +49,7 @@ try {
   & $python -c "import cantex_sdk, aiohttp; print('deps_ok')"
 } catch {
   Write-Host "Dependency check failed: missing cantex_sdk or aiohttp." -ForegroundColor Red
-  Write-Host "Please ensure D:\CCnetwork\cantex_sdk exists and Python >= 3.11." -ForegroundColor Yellow
+  Write-Host "Please ensure cantex_sdk exists under project folder (or parent folder) and Python >= 3.11." -ForegroundColor Yellow
   throw
 }
 

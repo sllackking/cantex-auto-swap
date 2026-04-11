@@ -24,16 +24,10 @@ python --version
 pip --version
 ```
 
-## 3. 安装 cantex_sdk（必须）
-优先使用官方仓库：  
-https://github.com/caviarnine/cantex_sdk
-
-```powershell
-cd D:\CCnetwork
-git clone https://github.com/caviarnine/cantex_sdk.git
-cd D:\CCnetwork\cantex-auto-swap
-python -m pip install -e D:\CCnetwork\cantex_sdk
-```
+## 3. 关于 cantex_sdk（默认无需单独下载）
+- 分享版已内置 `cantex_sdk`，`run-ui.ps1` 会自动安装。
+- 只有当你自己删掉了 `cantex_sdk` 目录，才需要手动安装官方 SDK：
+  https://github.com/caviarnine/cantex_sdk
 
 ## 4. 下载项目
 ```powershell
@@ -68,7 +62,7 @@ powershell -ExecutionPolicy Bypass -File .\run-ui.ps1
 - 先小金额测试，再逐步放大
 
 ## 9. 常见问题
-- `No module named cantex_sdk`：先安装 `cantex_sdk` 后再运行 `run-ui.ps1`
+- `No module named cantex_sdk`：先确认项目目录里有 `cantex_sdk` 文件夹，再运行 `run-ui.ps1`
 - 页面打不开：检查终端端口输出、代理和防火墙
 
 ## 10. 开源与贡献
