@@ -33,6 +33,7 @@ _lock = threading.Lock()
 _wallets_lock = threading.Lock()
 _procs: dict[str, subprocess.Popen[str]] = {}
 _network_fee_cache: dict[str, Any] = {"ts": 0.0, "value": None}
+_HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
 
 
 def import_cantex_sdk():
@@ -116,6 +117,19 @@ def keypair_exists(wallets: list[dict[str, Any]], op: str, tr: str) -> bool:
     return False
 
 
+def is_valid_hex_key(value: str) -> bool:
+    s = (value or "").strip()
+    if not s:
+        return False
+    if s.lower() == "replace_me":
+        return False
+    if s.startswith(("0x", "0X")):
+        return False
+    if not _HEX_RE.fullmatch(s):
+        return False
+    return (len(s) % 2) == 0
+
+
 def mask_key(key: str) -> str:
     s = (key or "").strip()
     if len(s) <= 12:
@@ -173,31 +187,30 @@ def start_bot() -> tuple[bool, str]:
         errors: list[str] = []
 
         if not wallets:
+            return False, "请先在钱包管理导入钱包后再启动。"
+        if not active_wallets:
+            return False, "所有钱包都已停用，未启动机器人。"
+        for w in active_wallets:
+            wid = str(w.get("id", "")).strip()
+            op = str(w.get("operator_key", "")).strip()
+            tr = str(w.get("trading_key", "")).strip()
+            if not wid or not op or not tr:
+                errors.append(f"钱包缺少必要字段: {w.get('name', wid or 'unknown')}")
+                continue
+            if not is_valid_hex_key(op) or not is_valid_hex_key(tr):
+                errors.append(f"钱包{wallet_seq(w, 0)} 私钥格式无效")
+                continue
             cmd = [str(PYTHON_PATH), str(MAIN_PATH), "--config", str(CONFIG_PATH), "--dotenv", str(DOTENV_PATH)]
-            p = subprocess.Popen(cmd, cwd=str(ROOT), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True)
-            _procs["default"] = p
+            p = subprocess.Popen(
+                cmd,
+                cwd=str(ROOT),
+                env=build_env_for_wallet(w, len(active_wallets)),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+            _procs[wid] = p
             started += 1
-        else:
-            if not active_wallets:
-                return False, "所有钱包都已停用，未启动机器人。"
-            for w in active_wallets:
-                wid = str(w.get("id", "")).strip()
-                op = str(w.get("operator_key", "")).strip()
-                tr = str(w.get("trading_key", "")).strip()
-                if not wid or not op or not tr:
-                    errors.append(f"钱包缺少必要字段: {w.get('name', wid or 'unknown')}")
-                    continue
-                cmd = [str(PYTHON_PATH), str(MAIN_PATH), "--config", str(CONFIG_PATH), "--dotenv", str(DOTENV_PATH)]
-                p = subprocess.Popen(
-                    cmd,
-                    cwd=str(ROOT),
-                    env=build_env_for_wallet(w, len(active_wallets)),
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    text=True,
-                )
-                _procs[wid] = p
-                started += 1
 
         if started == 0:
             return False, "没有成功启动任何机器人。" + ("；" + "；".join(errors) if errors else "")
@@ -625,14 +638,9 @@ def _pick_quote_keys() -> tuple[str, str]:
             continue
         op = str(w.get("operator_key", "")).strip()
         tr = str(w.get("trading_key", "")).strip()
-        if op and tr:
+        if is_valid_hex_key(op) and is_valid_hex_key(tr):
             return op, tr
-    load_dotenv()
-    op = (os.getenv("CANTEX_OPERATOR_KEY") or os.getenv("OPERATOR_PRIVATE_KEY_HEX") or "").strip()
-    tr = (os.getenv("CANTEX_TRADING_KEY") or os.getenv("INTENT_TRADING_PRIVATE_KEY_HEX") or "").strip()
-    if not op or not tr:
-        raise RuntimeError("未找到可用钱包私钥。")
-    return op, tr
+    raise RuntimeError("请先在钱包管理导入并启用有效钱包（私钥需为纯hex，不带0x）。")
 
 
 async def _fetch_live_network_fee_async(cfg: dict[str, Any]) -> str:
@@ -1350,6 +1358,8 @@ class Handler(BaseHTTPRequestHandler):
                 comment = str(payload.get("comment", "")).strip()
                 if not op or not tr:
                     raise ValueError("请填写两把私钥。")
+                if not is_valid_hex_key(op) or not is_valid_hex_key(tr):
+                    raise ValueError("私钥格式无效：必须是纯hex（不带0x，且不能是占位值）。")
                 with _wallets_lock:
                     wallets = load_wallets()
                     if keypair_exists(wallets, op, tr):
@@ -1399,6 +1409,10 @@ class Handler(BaseHTTPRequestHandler):
                         if not op or not tr:
                             skipped += 1
                             details.append(f"第{i}行字段缺失")
+                            continue
+                        if not is_valid_hex_key(op) or not is_valid_hex_key(tr):
+                            skipped += 1
+                            details.append(f"第{i}行私钥格式无效")
                             continue
                         if keypair_exists(wallets, op, tr):
                             skipped += 1
