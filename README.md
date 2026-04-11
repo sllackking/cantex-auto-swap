@@ -7,6 +7,11 @@
 - 往返交易（A->B 后再 B->A）
 - 日志归档（清空时自动备份历史日志）
 
+## 便携分享版
+- 仓库内提供可直接分发的版本：`portable-share/`
+- 给朋友使用时，直接把 `portable-share` 整个文件夹发给对方即可
+- 对方双击 `portable-share/start.bat` 就能自动初始化并启动 UI
+
 ## 1. 环境要求
 - Windows 10/11
 - Python 3.11 或 3.12

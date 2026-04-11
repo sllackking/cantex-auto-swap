@@ -1,0 +1,48 @@
+{
+  "loop": {
+    "interval_seconds": 15
+  },
+  "gas": {
+    "provider": "none",
+    "max_gwei": 8.0,
+    "fixed_gwei": 5.0,
+    "eth_rpc_url": "https://rpc.ankr.com/eth"
+  },
+  "trade": {
+    "dry_run": true,
+    "roundtrip_enabled": false,
+    "max_trades": 1,
+    "concurrent_wallets": 1,
+    "use_max_balance": false,
+    "reserve_amount": "0",
+    "quote_params": {
+      "sell_amount": "10",
+      "sell_instrument": {
+        "admin": "REPLACE_WITH_ADMIN_PARTY",
+        "id": "REPLACE_WITH_INSTRUMENT_ID"
+      },
+      "buy_instrument": {
+        "admin": "REPLACE_WITH_ADMIN_PARTY",
+        "id": "REPLACE_WITH_INSTRUMENT_ID"
+      }
+    },
+    "swap_params": {
+      "sell_amount": "10",
+      "sell_instrument": {
+        "admin": "REPLACE_WITH_ADMIN_PARTY",
+        "id": "REPLACE_WITH_INSTRUMENT_ID"
+      },
+      "buy_instrument": {
+        "admin": "REPLACE_WITH_ADMIN_PARTY",
+        "id": "REPLACE_WITH_INSTRUMENT_ID"
+      }
+    },
+    "max_price_impact_bps": 200,
+    "max_network_fee": "1",
+    "min_expected_out": "0"
+  },
+  "logging": {
+    "level": "INFO",
+    "log_file": "bot.log"
+  }
+}
