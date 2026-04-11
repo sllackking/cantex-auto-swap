@@ -34,6 +34,13 @@ _wallets_lock = threading.Lock()
 _procs: dict[str, subprocess.Popen[str]] = {}
 _network_fee_cache: dict[str, Any] = {"ts": 0.0, "value": None}
 _HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
+_batch_wallets: list[dict[str, Any]] = []
+_batch_cursor: int = 0
+_batch_size: int = 1
+_batch_errors: list[str] = []
+_batch_stop_requested: bool = False
+_batch_active: bool = False
+_batch_thread: threading.Thread | None = None
 
 
 def import_cantex_sdk():
@@ -146,10 +153,78 @@ def cleanup_procs() -> None:
         _procs.pop(k, None)
 
 
+def _resolve_batch_size(active_wallet_count: int) -> int:
+    try:
+        cfg = load_config()
+        trade_cfg = cfg.get("trade", {}) if isinstance(cfg, dict) else {}
+        raw = int(trade_cfg.get("concurrent_wallets", 1) or 1)
+    except Exception:
+        raw = 1
+    if raw <= 0:
+        raw = 1
+    if active_wallet_count <= 0:
+        return 1
+    return min(raw, active_wallet_count)
+
+
+def _spawn_wallet_proc_locked(wallet: dict[str, Any], active_wallets_count: int) -> tuple[bool, str]:
+    wid = str(wallet.get("id", "")).strip()
+    op = str(wallet.get("operator_key", "")).strip()
+    tr = str(wallet.get("trading_key", "")).strip()
+    if not wid or not op or not tr:
+        return False, f"钱包缺少必要字段: {wallet.get('name', wid or 'unknown')}"
+    if not is_valid_hex_key(op) or not is_valid_hex_key(tr):
+        return False, f"钱包{wallet_seq(wallet, 0)} 私钥格式无效"
+    cmd = [str(PYTHON_PATH), str(MAIN_PATH), "--config", str(CONFIG_PATH), "--dotenv", str(DOTENV_PATH)]
+    p = subprocess.Popen(
+        cmd,
+        cwd=str(ROOT),
+        env=build_env_for_wallet(wallet, active_wallets_count),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    _procs[wid] = p
+    return True, ""
+
+
+def _dispatch_batch_locked() -> int:
+    global _batch_cursor
+    started_now = 0
+    while len(_procs) < _batch_size and _batch_cursor < len(_batch_wallets):
+        wallet = _batch_wallets[_batch_cursor]
+        _batch_cursor += 1
+        ok, err = _spawn_wallet_proc_locked(wallet, _batch_size)
+        if ok:
+            started_now += 1
+        elif err:
+            _batch_errors.append(err)
+    return started_now
+
+
+def _batch_manager_loop() -> None:
+    global _batch_active, _batch_thread
+    try:
+        while True:
+            with _lock:
+                cleanup_procs()
+                if _batch_stop_requested:
+                    _batch_active = False
+                    return
+                _dispatch_batch_locked()
+                if _batch_cursor >= len(_batch_wallets) and not _procs:
+                    _batch_active = False
+                    return
+            time.sleep(1.0)
+    finally:
+        with _lock:
+            _batch_thread = None
+
+
 def is_running() -> bool:
     with _lock:
         cleanup_procs()
-        return bool(_procs)
+        return bool(_procs) or _batch_active
 
 
 def running_info() -> list[dict[str, Any]]:
@@ -170,9 +245,10 @@ def build_env_for_wallet(wallet: dict[str, Any], active_wallets_count: int = 0) 
 
 
 def start_bot() -> tuple[bool, str]:
+    global _batch_wallets, _batch_cursor, _batch_size, _batch_errors, _batch_stop_requested, _batch_active, _batch_thread
     with _lock:
         cleanup_procs()
-        if _procs:
+        if _procs or _batch_active:
             return False, "机器人已在运行。"
         if not PYTHON_PATH.exists():
             return False, f"未找到 Python: {PYTHON_PATH}"
@@ -190,49 +266,52 @@ def start_bot() -> tuple[bool, str]:
             return False, "请先在钱包管理导入钱包后再启动。"
         if not active_wallets:
             return False, "所有钱包都已停用，未启动机器人。"
-        for w in active_wallets:
-            wid = str(w.get("id", "")).strip()
-            op = str(w.get("operator_key", "")).strip()
-            tr = str(w.get("trading_key", "")).strip()
-            if not wid or not op or not tr:
-                errors.append(f"钱包缺少必要字段: {w.get('name', wid or 'unknown')}")
-                continue
-            if not is_valid_hex_key(op) or not is_valid_hex_key(tr):
-                errors.append(f"钱包{wallet_seq(w, 0)} 私钥格式无效")
-                continue
-            cmd = [str(PYTHON_PATH), str(MAIN_PATH), "--config", str(CONFIG_PATH), "--dotenv", str(DOTENV_PATH)]
-            p = subprocess.Popen(
-                cmd,
-                cwd=str(ROOT),
-                env=build_env_for_wallet(w, len(active_wallets)),
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                text=True,
-            )
-            _procs[wid] = p
-            started += 1
+        _batch_wallets = list(active_wallets)
+        _batch_cursor = 0
+        _batch_size = _resolve_batch_size(len(active_wallets))
+        _batch_errors = []
+        _batch_stop_requested = False
+        _batch_active = True
+        started = _dispatch_batch_locked()
+        _batch_thread = threading.Thread(target=_batch_manager_loop, name="wallet-batch-manager", daemon=True)
+        _batch_thread.start()
+        errors = list(_batch_errors)
 
         if started == 0:
+            if wallets:
+                # If first batch has zero started but there are remaining wallets, manager may still continue
+                # after skipping malformed entries. Keep running state when queue remains.
+                if _batch_active and _batch_cursor < len(_batch_wallets):
+                    return True, f"队列已启动（总钱包 {len(active_wallets)}，并发 {max(1, _batch_size)}）。"
             return False, "没有成功启动任何机器人。" + ("；" + "；".join(errors) if errors else "")
         # Quick liveness check: catch wallets that crash immediately (bad keys/config).
         time.sleep(1.0)
         cleanup_procs()
         alive = len(_procs)
-        if alive == 0:
+        if alive == 0 and not _batch_active:
             return False, "机器人启动后立即退出，请检查钱包私钥格式或配置。"
         msg = f"已启动 {started} 个机器人。"
         if wallets:
-            msg += f"（总钱包 {len(wallets)}，本次启动 {len(active_wallets)}，存活 {alive}）"
+            msg += f"（总钱包 {len(wallets)}，本次启动 {len(active_wallets)}，并发 {max(1, _batch_size)}，存活 {alive}）"
         if errors:
             msg += " 跳过: " + "；".join(errors)
         return True, msg
 
 
 def stop_bot() -> tuple[bool, str]:
+    global _batch_wallets, _batch_cursor, _batch_size, _batch_errors, _batch_stop_requested, _batch_active, _batch_thread
+    manager_thread: threading.Thread | None = None
     with _lock:
         cleanup_procs()
-        if not _procs:
+        if not _procs and not _batch_active:
             return False, "机器人未运行。"
+        _batch_stop_requested = True
+        _batch_active = False
+        _batch_wallets = []
+        _batch_cursor = 0
+        _batch_size = 1
+        _batch_errors = []
+        manager_thread = _batch_thread
         n = len(_procs)
         for p in list(_procs.values()):
             p.terminate()
@@ -242,7 +321,14 @@ def stop_bot() -> tuple[bool, str]:
             except subprocess.TimeoutExpired:
                 p.kill()
         _procs.clear()
-        return True, f"已停止 {n} 个机器人。"
+    if manager_thread and manager_thread.is_alive():
+        try:
+            manager_thread.join(timeout=2.0)
+        except Exception:
+            pass
+    with _lock:
+        _batch_thread = None
+    return True, f"已停止 {n} 个机器人。"
 
 
 def read_tail_lines(limit: int = 300) -> str:
@@ -1184,7 +1270,21 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/status":
             info = running_info()
-            json_response(self, {"ok": True, "running": len(info) > 0, "running_count": len(info), "instances": info})
+            with _lock:
+                pending = max(len(_batch_wallets) - _batch_cursor, 0) if _batch_active else 0
+                batch_size = _batch_size if _batch_active else 0
+                running = bool(info) or _batch_active
+            json_response(
+                self,
+                {
+                    "ok": True,
+                    "running": running,
+                    "running_count": len(info),
+                    "instances": info,
+                    "batch_pending": pending,
+                    "batch_size": batch_size,
+                },
+            )
             return
 
         if path == "/api/gas":
