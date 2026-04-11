@@ -1,0 +1,14 @@
+﻿Cantex 自动交易 - 便携分享版
+
+使用方法：
+1) 安装 Python 3.11/3.12（勾选 Add Python to PATH）
+2) 双击 start.bat
+3) 浏览器打开 http://127.0.0.1:39087
+
+说明：
+- 已内置 cantex_sdk
+- 脚本会自动安装依赖
+- 首次建议开启测试模式（dry_run）
+
+关闭方法：
+- 在终端按 Ctrl + C

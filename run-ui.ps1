@@ -1,25 +1,27 @@
 ﻿Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
-
 Set-Location $PSScriptRoot
 
-if (-not (Test-Path .venv312)) {
+function New-VenvIfNeeded {
+  if (Test-Path .venv312) { return }
   try {
     py -3.12 -m venv .venv312
-  } catch {
+    return
+  } catch {}
+  try {
     py -3.11 -m venv .venv312
-  }
+    return
+  } catch {}
+  python -m venv .venv312
 }
 
+New-VenvIfNeeded
 $python = Join-Path $PSScriptRoot ".venv312\Scripts\python.exe"
 
-if (-not (Test-Path config.json)) {
-  Copy-Item config.json.example config.json
-}
-
-if (-not (Test-Path .env)) {
-  Copy-Item .env.example .env
-}
+if (-not (Test-Path config.json)) { Copy-Item config.json.example config.json }
+if (-not (Test-Path .env)) { Copy-Item .env.example .env }
+if (-not (Test-Path wallets.json)) { '[]' | Set-Content wallets.json -Encoding UTF8 }
+if (-not (Test-Path bot.log)) { '' | Set-Content bot.log -Encoding UTF8 }
 
 & $python -m pip install --disable-pip-version-check -q -U pip setuptools wheel
 
@@ -30,26 +32,17 @@ if (Test-Path requirements.txt) {
   }
 }
 
-$sdkCandidates = @(
-  (Join-Path $PSScriptRoot "cantex_sdk"),
-  (Join-Path (Split-Path $PSScriptRoot -Parent) "cantex_sdk")
-)
-foreach ($sdkLocal in $sdkCandidates) {
-  $sdkLocalSrc = Join-Path $sdkLocal "src"
-  if (Test-Path $sdkLocalSrc) {
-    & $python -m pip install --disable-pip-version-check -e $sdkLocal
-    break
-  }
+$sdkLocal = Join-Path $PSScriptRoot "cantex_sdk"
+if (Test-Path (Join-Path $sdkLocal "src")) {
+  & $python -m pip install --disable-pip-version-check -e $sdkLocal
 }
 
-# Ensure critical runtime deps exist even if sdk metadata install is incomplete.
 & $python -m pip install --disable-pip-version-check aiohttp cryptography ecdsa pydantic typing_extensions
 
 try {
   & $python -c "import cantex_sdk, aiohttp; print('deps_ok')"
 } catch {
-  Write-Host "Dependency check failed: missing cantex_sdk or aiohttp." -ForegroundColor Red
-  Write-Host "Please ensure cantex_sdk exists under project folder (or parent folder) and Python >= 3.11." -ForegroundColor Yellow
+  Write-Host "依赖检查失败：cantex_sdk 或 aiohttp 不可用。" -ForegroundColor Red
   throw
 }
 
@@ -58,4 +51,4 @@ $env:UI_PORT = "39087"
 $env:NO_PROXY = "127.0.0.1,localhost,::1"
 $env:no_proxy = "127.0.0.1,localhost,::1"
 
-& .\.venv312\Scripts\python.exe .\ui_server.py
+& $python .\ui_server.py

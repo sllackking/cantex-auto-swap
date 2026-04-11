@@ -39,7 +39,9 @@ def import_cantex_sdk():
     try:
         return __import__("cantex_sdk")
     except ModuleNotFoundError:
-        sdk_src = ROOT.parent / "cantex_sdk" / "src"
+        sdk_src = ROOT / "cantex_sdk" / "src"
+        if not sdk_src.exists():
+            sdk_src = ROOT.parent / "cantex_sdk" / "src"
         if sdk_src.exists():
             sys.path.insert(0, str(sdk_src))
             try:
@@ -48,7 +50,7 @@ def import_cantex_sdk():
                 raise RuntimeError(
                     "cantex_sdk 依赖不完整（可能缺少 aiohttp 等），请使用 run-ui.ps1 启动。"
                 ) from exc
-        raise RuntimeError("未找到 cantex_sdk，请检查 D:\\CCnetwork\\cantex_sdk 或虚拟环境安装。")
+        raise RuntimeError("未找到 cantex_sdk，请检查当前目录下的 cantex_sdk 文件夹或虚拟环境安装。")
 
 
 def load_dotenv() -> None:

@@ -1,46 +1,19 @@
-Set-StrictMode -Version Latest
+﻿Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
-
 Set-Location $PSScriptRoot
 
-$venvPath = ".venv312"
-
-if (-not (Test-Path $venvPath)) {
-  py -3.12 -m venv $venvPath
+if (-not (Test-Path .venv312)) {
+  try { py -3.12 -m venv .venv312 } catch { try { py -3.11 -m venv .venv312 } catch { python -m venv .venv312 } }
 }
 
-. "$venvPath\Scripts\Activate.ps1"
+$python = Join-Path $PSScriptRoot ".venv312\Scripts\python.exe"
+if (-not (Test-Path config.json)) { Copy-Item config.json.example config.json }
+if (-not (Test-Path .env)) { Copy-Item .env.example .env }
 
-if (-not (Test-Path config.json)) {
-  Copy-Item config.json.example config.json
+& $python -m pip install --disable-pip-version-check -q -U pip setuptools wheel
+if (Test-Path (Join-Path $PSScriptRoot "cantex_sdk\src")) {
+  & $python -m pip install --disable-pip-version-check -e (Join-Path $PSScriptRoot "cantex_sdk")
 }
+& $python -m pip install --disable-pip-version-check aiohttp cryptography ecdsa pydantic typing_extensions
 
-if (-not (Test-Path .env)) {
-  Copy-Item .env.example .env
-}
-
-$hasSdk = (& python -c "import importlib.util; print('1' if importlib.util.find_spec('cantex_sdk') else '0')").Trim()
-if ($hasSdk -ne "1") {
-  $localSdkCandidates = @(
-    "D:\\CCnetwork\\cantex_sdk",
-    (Join-Path $PSScriptRoot "vendor\\cantex_sdk")
-  )
-  foreach ($sdkPath in $localSdkCandidates) {
-    if (Test-Path $sdkPath) {
-      Write-Host "Installing local cantex_sdk from: $sdkPath"
-      python -m pip install -e $sdkPath
-      break
-    }
-  }
-}
-
-$hasSdk = (& python -c "import importlib.util; print('1' if importlib.util.find_spec('cantex_sdk') else '0')").Trim()
-if ($hasSdk -ne "1") {
-  Write-Host ""
-  Write-Host "cantex_sdk is not installed."
-  Write-Host "Please place SDK source at D:\\CCnetwork\\cantex_sdk or D:\\CCnetwork\\cantex-auto-swap\\vendor\\cantex_sdk"
-  Write-Host "Then run this script again."
-  exit 1
-}
-
-python .\src\main.py --config .\config.json --dotenv .\.env
+& $python .\src\main.py --config .\config.json --dotenv .\.env
