@@ -8,6 +8,12 @@
 2. 双击 `start.bat`
 3. 打开浏览器访问 `http://127.0.0.1:39087`
 
+## 网络自检（朋友电脑必做）
+- 双击 `network-check.bat`
+- 或执行：
+  `powershell -ExecutionPolicy Bypass -File .\network-check.ps1`
+- 把输出结果发回来，可以快速定位是 DNS、443 端口、代理还是 API 超时问题
+
 ## 说明
 - 已内置 `cantex_sdk`
 - 启动脚本会自动安装依赖
