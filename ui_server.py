@@ -737,18 +737,13 @@ async def _fetch_pools_async() -> list[dict[str, Any]]:
     CantexSDK = getattr(sdk_module, "CantexSDK")
     OperatorKeySigner = getattr(sdk_module, "OperatorKeySigner")
     IntentTradingKeySigner = getattr(sdk_module, "IntentTradingKeySigner")
-
-    operator_hex = os.getenv("CANTEX_OPERATOR_KEY") or os.getenv("OPERATOR_PRIVATE_KEY_HEX")
-    intent_hex = os.getenv("CANTEX_TRADING_KEY") or os.getenv("INTENT_TRADING_PRIVATE_KEY_HEX")
     base_url = os.getenv("CANTEX_BASE_URL") or os.getenv("CANTEX_API_BASE_URL") or "https://api.cantex.io"
-    if not operator_hex or not intent_hex:
-        raise RuntimeError(".env 缺少 Cantex 密钥。")
+    operator_hex, intent_hex = _pick_quote_keys()
 
     operator = OperatorKeySigner.from_hex(operator_hex)
     intent = IntentTradingKeySigner.from_hex(intent_hex)
-    SECRETS_DIR.mkdir(parents=True, exist_ok=True)
-    api_key_path = str((SECRETS_DIR / "ui_pools_api_key.txt").resolve())
-    async with CantexSDK(operator, intent, base_url=base_url, api_key_path=api_key_path) as sdk:
+    # Avoid stale cached api-key mismatch between different wallets.
+    async with CantexSDK(operator, intent, base_url=base_url, api_key_path=None) as sdk:
         await sdk.authenticate()
         pools_info = await sdk.get_pool_info()
         pools: list[dict[str, Any]] = []
