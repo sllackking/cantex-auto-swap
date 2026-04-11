@@ -11,7 +11,7 @@ import random
 import sys
 import time
 from dataclasses import asdict, is_dataclass
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from pathlib import Path
 from typing import Any
 from urllib.request import Request, urlopen
@@ -20,6 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SECRETS_DIR = ROOT / "secrets"
 GAS_GATE_PATH = ROOT / "runtime_gas_gate.json"
 GAS_GATE_LOCK_PATH = ROOT / "runtime_gas_gate.lock"
+TRADE_SLOT_DIR = ROOT / "runtime_trade_slots"
 
 
 def load_dotenv(dotenv_path: Path) -> None:
@@ -193,6 +194,15 @@ class CantexAdapter:
     async def swap(self, params: dict[str, Any]) -> Any:
         return await self._invoke("swap", self._normalize_trade_params(params))
 
+    async def swap_and_confirm(self, params: dict[str, Any], timeout: int = 30) -> Any:
+        payload = self._normalize_trade_params(params)
+        payload["timeout"] = int(timeout)
+        method = getattr(self.sdk, "swap_and_confirm", None)
+        if method is None:
+            # Fallback for older SDK versions.
+            return await self._invoke("swap", payload)
+        return await self._invoke("swap_and_confirm", payload)
+
     async def get_account_info(self) -> Any:
         return await self._invoke("get_account_info", {})
 
@@ -231,6 +241,31 @@ class AutoSwapBot:
         self.executed_trades = 0
         self.waiting_fee_logged = False
         self.waiting_fee_last = Decimal("-1")
+        self.trade_slot_index: int | None = None
+        self.balance_epsilon = Decimal("0.00000001")
+
+    def _enough_balance(self, balance: Decimal, need: Decimal) -> bool:
+        return balance + self.balance_epsilon >= need
+
+    def _amount_decimal_places(self) -> int:
+        trade_cfg = self.config.get("trade", {})
+        use_max_balance = bool(trade_cfg.get("use_max_balance", False))
+        pct = to_decimal(trade_cfg.get("max_balance_pct", "0"), Decimal("0"))
+        # User rule: when 100% max-balance mode is enabled, truncate to 5 decimals.
+        if use_max_balance and pct == Decimal("100"):
+            return 5
+        # Default precision for other modes.
+        return 8
+
+    def _truncate_amount(self, amount: Decimal) -> Decimal:
+        places = self._amount_decimal_places()
+        quantum = Decimal("1") if places == 0 else Decimal("1").scaleb(-places)
+        out = amount.quantize(quantum, rounding=ROUND_DOWN)
+        # If configured precision makes a small positive amount become 0,
+        # fallback to 8dp truncation to keep the trade executable.
+        if amount > Decimal("0") and out <= Decimal("0"):
+            out = amount.quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
+        return out
 
     def _read_gas_gate(self) -> dict[str, Any] | None:
         try:
@@ -243,6 +278,71 @@ class AutoSwapBot:
 
     def _write_gas_gate(self, data: dict[str, Any]) -> None:
         GAS_GATE_PATH.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+    def _concurrency_limit(self) -> int:
+        trade_cfg = self.config.get("trade", {})
+        try:
+            v = int(trade_cfg.get("concurrent_wallets", 1) or 1)
+            return v if v > 0 else 1
+        except Exception:
+            return 1
+
+    def _acquire_trade_slot(self) -> bool:
+        limit = self._concurrency_limit()
+        try:
+            active_total = int((os.getenv("ACTIVE_WALLETS_COUNT") or "0").strip() or "0")
+        except Exception:
+            active_total = 0
+        # If concurrency limit covers all active wallets, allow true parallel execution.
+        if active_total > 0 and limit >= active_total:
+            self.trade_slot_index = None
+            return True
+        TRADE_SLOT_DIR.mkdir(parents=True, exist_ok=True)
+        for idx in range(limit):
+            slot_path = TRADE_SLOT_DIR / f"slot_{idx}.lock"
+            if slot_path.exists():
+                try:
+                    raw = slot_path.read_text(encoding="utf-8", errors="ignore").strip()
+                    owner_pid = int(raw) if raw else 0
+                except Exception:
+                    owner_pid = 0
+                stale = False
+                if owner_pid <= 0:
+                    stale = True
+                else:
+                    try:
+                        os.kill(owner_pid, 0)
+                    except OSError:
+                        stale = True
+                    except Exception:
+                        stale = False
+                if stale:
+                    try:
+                        os.remove(str(slot_path))
+                    except Exception:
+                        pass
+            try:
+                fd = os.open(str(slot_path), os.O_CREAT | os.O_EXCL | os.O_RDWR)
+                os.write(fd, str(os.getpid()).encode("utf-8"))
+                os.close(fd)
+                self.trade_slot_index = idx
+                return True
+            except FileExistsError:
+                continue
+            except Exception:
+                continue
+        return False
+
+    def _release_trade_slot(self) -> None:
+        if self.trade_slot_index is None:
+            return
+        slot_path = TRADE_SLOT_DIR / f"slot_{self.trade_slot_index}.lock"
+        self.trade_slot_index = None
+        try:
+            if slot_path.exists():
+                os.remove(str(slot_path))
+        except Exception:
+            pass
 
     async def _detect_network_fee(self, quote_params: dict[str, Any], trade_cfg: dict[str, Any]) -> Decimal:
         probe = dict(quote_params)
@@ -346,6 +446,7 @@ class AutoSwapBot:
 
     def _build_reverse_params(self, forward_quote: Any, forward_swap_params: dict[str, Any]) -> dict[str, Any]:
         out_amount = to_decimal(getattr(forward_quote, "returned_amount", None))
+        out_amount = self._truncate_amount(out_amount)
         if out_amount <= Decimal("0"):
             raise RuntimeError("Round-trip cannot continue: forward quote returned_amount <= 0")
         return {
@@ -364,6 +465,61 @@ class AutoSwapBot:
         token = self._inst_id(raw)
         return "CC" if token == "Amulet" else token
 
+    async def _wait_instrument_balance(
+        self,
+        instrument_raw: Any,
+        min_amount: Decimal,
+        timeout_seconds: int = 30,
+    ) -> bool:
+        if min_amount <= Decimal("0"):
+            return True
+        normalized = self.adapter._normalize_trade_params(
+            {
+                "sell_amount": "1",
+                "sell_instrument": instrument_raw,
+                "buy_instrument": instrument_raw,
+            }
+        )
+        target = normalized["sell_instrument"]
+        deadline = time.time() + max(1, int(timeout_seconds))
+        while time.time() <= deadline:
+            try:
+                account = await self.adapter.get_account_info()
+                balance = Decimal("0")
+                for token in getattr(account, "tokens", []):
+                    inst = getattr(token, "instrument", None)
+                    if (
+                        getattr(inst, "id", None) == target.id
+                        and getattr(inst, "admin", None) == target.admin
+                    ):
+                        balance = to_decimal(getattr(token, "unlocked_amount", "0"), Decimal("0"))
+                        break
+                if self._enough_balance(balance, min_amount):
+                    return True
+            except Exception:
+                pass
+            await asyncio.sleep(1.0)
+        return False
+
+    async def _get_instrument_balance(self, instrument_raw: Any) -> Decimal:
+        normalized = self.adapter._normalize_trade_params(
+            {
+                "sell_amount": "1",
+                "sell_instrument": instrument_raw,
+                "buy_instrument": instrument_raw,
+            }
+        )
+        target = normalized["sell_instrument"]
+        account = await self.adapter.get_account_info()
+        for token in getattr(account, "tokens", []):
+            inst = getattr(token, "instrument", None)
+            if (
+                getattr(inst, "id", None) == target.id
+                and getattr(inst, "admin", None) == target.admin
+            ):
+                return to_decimal(getattr(token, "unlocked_amount", "0"), Decimal("0"))
+        return Decimal("0")
+
     async def _pick_forward_amount(
         self,
         trade_cfg: dict[str, Any],
@@ -373,6 +529,11 @@ class AutoSwapBot:
         use_max_balance = bool(trade_cfg.get("use_max_balance", False))
         if use_max_balance:
             reserve_amount = to_decimal(trade_cfg.get("reserve_amount", "0"), Decimal("0"))
+            pct = to_decimal(trade_cfg.get("max_balance_pct", "100"), Decimal("100"))
+            if pct <= Decimal("0"):
+                raise RuntimeError("max_balance_pct must be > 0")
+            if pct > Decimal("100"):
+                pct = Decimal("100")
             normalized = self.adapter._normalize_trade_params(
                 {
                     "sell_amount": "1",
@@ -391,12 +552,15 @@ class AutoSwapBot:
                 ):
                     balance = to_decimal(getattr(token, "unlocked_amount", "0"), Decimal("0"))
                     break
-            sellable = balance - reserve_amount
+            sellable = (balance - reserve_amount) * (pct / Decimal("100"))
             if sellable <= Decimal("0"):
                 raise RuntimeError(
                     f"use_max_balance enabled but sellable balance <= 0 "
-                    f"(balance={balance}, reserve_amount={reserve_amount})"
+                    f"(balance={balance}, reserve_amount={reserve_amount}, max_balance_pct={pct})"
                 )
+            sellable = self._truncate_amount(sellable)
+            if sellable <= Decimal("0"):
+                raise RuntimeError("sell_amount is 0; balance too small")
             return sellable
 
         raw_min = trade_cfg.get("sell_amount_min", default_amount)
@@ -408,9 +572,15 @@ class AutoSwapBot:
         if amount_max < amount_min:
             raise RuntimeError("sell_amount_max must be >= sell_amount_min")
         if amount_max == amount_min:
+            amount_min = self._truncate_amount(amount_min)
+            if amount_min <= Decimal("0"):
+                raise RuntimeError("sell_amount is 0; amount too small")
             return amount_min
         sampled = Decimal(str(random.uniform(float(amount_min), float(amount_max))))
-        return sampled.quantize(Decimal("0.00000001"))
+        sampled = self._truncate_amount(sampled)
+        if sampled <= Decimal("0"):
+            raise RuntimeError("sell_amount is 0; amount too small")
+        return sampled
 
     async def _execute_leg(
         self,
@@ -419,10 +589,98 @@ class AutoSwapBot:
         swap_params: dict[str, Any],
         dry_run: bool,
         label: str,
+        skip_balance_guard: bool = False,
+        adjust_to_balance_if_lower: bool = False,
     ) -> tuple[bool, Any]:
         sell_id = self._inst_label(swap_params.get("sell_instrument"))
         buy_id = self._inst_label(swap_params.get("buy_instrument"))
         sell_amount = to_decimal(swap_params.get("sell_amount"), Decimal("0"))
+
+        if not skip_balance_guard:
+            # Hard guard: never submit trade if unlocked balance is insufficient.
+            try:
+                balance = await self._get_instrument_balance(swap_params.get("sell_instrument"))
+            except Exception as exc:
+                self.logger.info(
+                    "TRADE_RESULT | %s -> %s | FAIL | wallet_address=%s | balance_check_error=%s",
+                    sell_id,
+                    buy_id,
+                    self.wallet_address,
+                    str(exc),
+                )
+                return False, None
+
+            # Safety rule: for CC -> other swaps, keep at least 1 CC after trade.
+            if self._inst_id(swap_params.get("sell_instrument")) == "Amulet":
+                remain_cc = balance - sell_amount
+                if remain_cc < Decimal("1"):
+                    self.logger.info(
+                        "TRADE_RESULT | %s -> %s | FAIL | wallet_address=%s | cc_reserve_guard | remain_cc=%s < 1",
+                        sell_id,
+                        buy_id,
+                        self.wallet_address,
+                        remain_cc,
+                    )
+                    return False, None
+            adjusted_once = False
+            if not self._enough_balance(balance, sell_amount):
+                if adjust_to_balance_if_lower and balance > Decimal("0"):
+                    adjusted = self._truncate_amount(balance)
+                    if adjusted > Decimal("0"):
+                        sell_amount = adjusted
+                        swap_params = dict(swap_params)
+                        quote_params = dict(quote_params)
+                        swap_params["sell_amount"] = str(sell_amount)
+                        quote_params["sell_amount"] = str(sell_amount)
+                        self.logger.info(
+                            "Adjust %s sell_amount to unlocked balance: %s",
+                            label,
+                            sell_amount,
+                        )
+                        adjusted_once = True
+                    else:
+                        self.logger.info(
+                            "TRADE_RESULT | %s -> %s | WAIT_BALANCE | wallet_address=%s | need=%s | unlocked=%s",
+                            sell_id,
+                            buy_id,
+                            self.wallet_address,
+                            sell_amount,
+                            balance,
+                        )
+                        return False, None
+                # After one-shot adjustment to current unlocked balance,
+                # execute immediately instead of entering wait loop.
+                if (not adjusted_once) and (not self._enough_balance(balance, sell_amount)):
+                    reverse_wait_log_delay = 5.0 if label == "Reverse" else 0.0
+                    if reverse_wait_log_delay <= 0:
+                        self.logger.info(
+                            "TRADE_RESULT | %s -> %s | WAIT_BALANCE | wallet_address=%s | need=%s | unlocked=%s",
+                            sell_id,
+                            buy_id,
+                            self.wallet_address,
+                            sell_amount,
+                            balance,
+                        )
+                        wait_log_next = time.time() + 10.0
+                    else:
+                        wait_log_next = time.time() + reverse_wait_log_delay
+                    while not self._enough_balance(balance, sell_amount):
+                        await asyncio.sleep(1.0)
+                        try:
+                            balance = await self._get_instrument_balance(swap_params.get("sell_instrument"))
+                        except Exception:
+                            continue
+                        if time.time() >= wait_log_next and (not self._enough_balance(balance, sell_amount)):
+                            self.logger.info(
+                                "TRADE_RESULT | %s -> %s | WAIT_BALANCE | wallet_address=%s | need=%s | unlocked=%s",
+                                sell_id,
+                                buy_id,
+                                self.wallet_address,
+                                sell_amount,
+                                balance,
+                            )
+                            wait_log_next = time.time() + 10.0
+
         quote = await self.adapter.get_swap_quote(quote_params)
         ok, reason = self._quote_ok(quote)
         network_fee_amount = to_decimal(
@@ -474,7 +732,19 @@ class AutoSwapBot:
                 network_fee_amount,
             )
         else:
-            result = await self.adapter.swap(swap_params)
+            confirm_timeout = int(self.config.get("trade", {}).get("confirm_timeout_seconds", 30))
+            try:
+                result = await self.adapter.swap_and_confirm(swap_params, timeout=confirm_timeout)
+            except Exception as exc:
+                self.logger.info(
+                    "TRADE_RESULT | %s -> %s | FAIL | wallet_address=%s | sell_amount=%s | swap_error=%s",
+                    sell_id,
+                    buy_id,
+                    self.wallet_address,
+                    sell_amount,
+                    str(exc),
+                )
+                return False, quote
             self.logger.info("%s swap executed: %s", label, as_dict(result) or result)
             self.logger.info(
                 "TRADE_RESULT | %s -> %s | SUCCESS | wallet_address=%s | sell_amount=%s | returned_amount=%s | network_fee=%s",
@@ -485,7 +755,6 @@ class AutoSwapBot:
                 returned_amount,
                 network_fee_amount,
             )
-        self.executed_trades += 1
         return True, quote
 
     async def run_forever(self) -> None:
@@ -494,7 +763,7 @@ class AutoSwapBot:
         interval = int(loop_cfg.get("interval_seconds", 15))
         dry_run = bool(trade_cfg.get("dry_run", True))
         roundtrip_enabled = bool(trade_cfg.get("roundtrip_enabled", False))
-        max_trades = int(trade_cfg.get("max_trades", 0))
+        max_trades = int(trade_cfg.get("max_trades", 1))
         quote_params = dict(trade_cfg.get("quote_params", {}))
         swap_params = dict(trade_cfg.get("swap_params", {}))
 
@@ -512,8 +781,14 @@ class AutoSwapBot:
             "Bot started. dry_run=%s, roundtrip_enabled=%s, max_trades=%s",
             dry_run,
             roundtrip_enabled,
-            max_trades if max_trades > 0 else "unlimited",
+            max_trades,
         )
+        self.logger.info("Concurrency limit resolved: %s", self._concurrency_limit())
+
+        if max_trades <= 0:
+            self.logger.info("max_trades=%s, no trades will be executed. Stopping bot.", max_trades)
+            await self.adapter.close()
+            return
 
         # Preflight: avoid endless 404 loop when pair isn't in any pool.
         normalized_quote = self.adapter._normalize_trade_params(quote_params)
@@ -529,6 +804,8 @@ class AutoSwapBot:
             await self.adapter.close()
             return
         self.logger.info("Pair validated in pool: %s", detail)
+
+        pending_reverse: dict[str, Any] | None = None
 
         try:
             while True:
@@ -546,12 +823,40 @@ class AutoSwapBot:
                     else:
                         self.logger.info("Gas check disabled (Canton/Cantex mode)")
 
-                    if max_trades > 0 and self.executed_trades >= max_trades:
+                    # max_trades counts cycles, not legs.
+                    # roundtrip_enabled=True: 1 cycle = forward + reverse.
+                    if self.executed_trades >= max_trades and pending_reverse is None:
                         self.logger.info(
                             "Reached max_trades=%s, stopping bot.",
                             max_trades,
                         )
                         return
+
+                    if not self._acquire_trade_slot():
+                        self.logger.info(
+                            "Trade slot busy. concurrency_limit=%s, waiting...",
+                            self._concurrency_limit(),
+                        )
+                        await asyncio.sleep(1.0)
+                        continue
+
+                    if pending_reverse is not None:
+                        ok_reverse, _ = await self._execute_leg(
+                            quote_params=dict(pending_reverse["quote_params"]),
+                            swap_params=dict(pending_reverse["swap_params"]),
+                            dry_run=dry_run,
+                            label="Reverse",
+                            skip_balance_guard=dry_run,
+                            adjust_to_balance_if_lower=True,
+                        )
+                        if ok_reverse:
+                            pending_reverse = None
+                            self.executed_trades += 1
+                            self.logger.info("Swap cycle completed. Starting next cycle immediately.")
+                        else:
+                            self.logger.info("Reverse pending; will retry reverse only.")
+                            await asyncio.sleep(interval)
+                        continue
 
                     try:
                         gate_ok = await self._wait_gas_gate(quote_params, trade_cfg, interval)
@@ -578,6 +883,7 @@ class AutoSwapBot:
                         continue
                     cycle_quote_params = dict(quote_params)
                     cycle_swap_params = dict(swap_params)
+                    forward_amount = self._truncate_amount(forward_amount)
                     cycle_quote_params["sell_amount"] = str(forward_amount)
                     cycle_swap_params["sell_amount"] = str(forward_amount)
                     self.logger.info("Forward sell_amount selected: %s", forward_amount)
@@ -587,6 +893,7 @@ class AutoSwapBot:
                         swap_params=cycle_swap_params,
                         dry_run=dry_run,
                         label="Forward",
+                        skip_balance_guard=bool(trade_cfg.get("use_max_balance", False)),
                     )
                     if not ok:
                         await asyncio.sleep(interval)
@@ -595,15 +902,28 @@ class AutoSwapBot:
                     if roundtrip_enabled:
                         reverse_swap_params = self._build_reverse_params(forward_quote, cycle_swap_params)
                         reverse_quote_params = dict(reverse_swap_params)
+                        pending_reverse = {
+                            "quote_params": reverse_quote_params,
+                            "swap_params": reverse_swap_params,
+                        }
                         ok_reverse, _ = await self._execute_leg(
-                            quote_params=reverse_quote_params,
-                            swap_params=reverse_swap_params,
+                            quote_params=dict(reverse_quote_params),
+                            swap_params=dict(reverse_swap_params),
                             dry_run=dry_run,
                             label="Reverse",
+                            skip_balance_guard=dry_run,
+                            adjust_to_balance_if_lower=True,
                         )
-                        if not ok_reverse:
-                            self.logger.warning("Reverse leg skipped due to quote constraints.")
+                        if ok_reverse:
+                            pending_reverse = None
+                            self.executed_trades += 1
+                            self.logger.info("Swap cycle completed. Starting next cycle immediately.")
+                        else:
+                            self.logger.info("Reverse pending; will retry reverse only.")
+                            await asyncio.sleep(interval)
+                        continue
 
+                    self.executed_trades += 1
                     self.logger.info("Swap cycle completed. Starting next cycle immediately.")
                     continue
                 except asyncio.CancelledError:
@@ -611,8 +931,11 @@ class AutoSwapBot:
                     break
                 except Exception as exc:
                     self.logger.exception("Loop error: %s", exc)
+                finally:
+                    self._release_trade_slot()
                 await asyncio.sleep(interval)
         finally:
+            self._release_trade_slot()
             await self.adapter.close()
 
 

@@ -19,7 +19,7 @@ from urllib.request import Request, urlopen
 
 
 ROOT = Path(__file__).resolve().parent
-UI_VERSION = "2026-04-09-bulk-v2"
+UI_VERSION = "2026-04-11-bulk-v28"
 CONFIG_PATH = ROOT / "config.json"
 DOTENV_PATH = ROOT / ".env"
 LOG_PATH = ROOT / "bot.log"
@@ -142,13 +142,14 @@ def running_info() -> list[dict[str, Any]]:
         return [{"wallet_id": wid, "pid": p.pid} for wid, p in _procs.items()]
 
 
-def build_env_for_wallet(wallet: dict[str, Any]) -> dict[str, str]:
+def build_env_for_wallet(wallet: dict[str, Any], active_wallets_count: int = 0) -> dict[str, str]:
     env = os.environ.copy()
     env["CANTEX_OPERATOR_KEY"] = str(wallet.get("operator_key", "")).strip()
     env["CANTEX_TRADING_KEY"] = str(wallet.get("trading_key", "")).strip()
     seq = wallet_seq(wallet, 1)
     env["WALLET_NAME"] = str(seq)
     env["WALLET_ADDRESS"] = str(wallet.get("address", "")).strip()
+    env["ACTIVE_WALLETS_COUNT"] = str(active_wallets_count)
     return env
 
 
@@ -166,15 +167,6 @@ def start_bot() -> tuple[bool, str]:
             key=lambda w: wallet_seq(w, 10**9),
         )
         active_wallets = [w for w in wallets if not bool(w.get("disabled", False))]
-        concurrent_wallets = 0
-        try:
-            cfg = load_config()
-            trade_cfg = cfg.get("trade", {}) if isinstance(cfg, dict) else {}
-            concurrent_wallets = int(trade_cfg.get("concurrent_wallets", 0) or 0)
-        except Exception:
-            concurrent_wallets = 0
-        if concurrent_wallets > 0:
-            active_wallets = active_wallets[:concurrent_wallets]
         started = 0
         errors: list[str] = []
 
@@ -197,7 +189,7 @@ def start_bot() -> tuple[bool, str]:
                 p = subprocess.Popen(
                     cmd,
                     cwd=str(ROOT),
-                    env=build_env_for_wallet(w),
+                    env=build_env_for_wallet(w, len(active_wallets)),
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     text=True,
@@ -283,6 +275,9 @@ def summarize_trade_results(limit: int = 300) -> str:
 
     amount_pat = re.compile(r"sell_amount=([0-9]+(?:\.[0-9]+)?)\s*\|\s*returned_amount=([0-9]+(?:\.[0-9]+)?)")
     gas_pat = re.compile(r"network_fee=([0-9]+(?:\.[0-9]+)?)")
+    wait_bal_pat = re.compile(r"need=([0-9]+(?:\.[0-9]+)?)\s*\|\s*unlocked=([0-9]+(?:\.[0-9]+)?)")
+    wait_bal_pat = re.compile(r"need=([0-9]+(?:\.[0-9]+)?)\s*\|\s*unlocked=([0-9]+(?:\.[0-9]+)?)")
+    wait_bal_pat = re.compile(r"need=([0-9]+(?:\.[0-9]+)?)\s*\|\s*unlocked=([0-9]+(?:\.[0-9]+)?)")
 
     for line in lines[-1200:]:
         m = pat.search(line)
@@ -293,10 +288,11 @@ def summarize_trade_results(limit: int = 300) -> str:
             text = "成功"
         elif status == "SUCCESS_DRY_RUN":
             text = "模拟成功"
+        elif status == "WAIT_BALANCE":
+            text = "余额不足"
         else:
             text = "失败"
         reason = (m.group("reason") or "").strip()
-        reason = re.sub(r"^\s*wallet_address=[^|]+\|\s*", "", reason)
         reason = re.sub(r"^\s*wallet_address=[^|]+\|\s*", "", reason)
         hhmmss = m.group("ts").split(" ")[-1]
         out = (
@@ -305,7 +301,10 @@ def summarize_trade_results(limit: int = 300) -> str:
         )
         mm = amount_pat.search(reason)
         gm = gas_pat.search(reason)
-        if "wait_gas" in reason:
+        wb = wait_bal_pat.search(reason)
+        if status == "WAIT_BALANCE" and wb:
+            out += f" | 需要={_to_2dp_down(wb.group(1))} | 余额={_to_2dp_down(wb.group(2))}"
+        elif "wait_gas" in reason:
             gas_txt = _to_2dp_down(gm.group(1)) if gm else "-"
             out += f" | gas:{gas_txt}丨等待gas降低中..."
         elif mm:
@@ -345,12 +344,16 @@ def summarize_wallet_trade_history(wallet_seq: int, limit: int = 20) -> str:
         sell = "CC" if m.group("sell") == "Amulet" else m.group("sell")
         buy = "CC" if m.group("buy") == "Amulet" else m.group("buy")
         status = m.group("status")
-        text = "成功" if status == "SUCCESS" else ("模拟成功" if status == "SUCCESS_DRY_RUN" else "失败")
+        text = "成功" if status == "SUCCESS" else ("模拟成功" if status == "SUCCESS_DRY_RUN" else ("余额不足" if status == "WAIT_BALANCE" else "失败"))
         reason = (m.group("reason") or "").strip()
+        reason = re.sub(r"^\s*wallet_address=[^|]+\|\s*", "", reason)
         item = f"{hhmmss} | 钱包{wallet_seq} | {sell}→{buy} | {text}"
         mm = amount_pat.search(reason)
         gm = gas_pat.search(reason)
-        if "wait_gas" in reason:
+        wb = wait_bal_pat.search(reason)
+        if status == "WAIT_BALANCE" and wb:
+            item += f" | 需要={wb.group(1)} | 余额={wb.group(2)}"
+        elif "wait_gas" in reason:
             gas_txt = gm.group(1) if gm else "-"
             item += f" | gas:{gas_txt}丨等待gas降低中..."
         elif mm:
@@ -385,13 +388,16 @@ def _wallet_history_from_lines(lines: list[str], wallet_seq: int, limit: int) ->
         sell = "CC" if m.group("sell") == "Amulet" else m.group("sell")
         buy = "CC" if m.group("buy") == "Amulet" else m.group("buy")
         status = m.group("status")
-        text = "成功" if status == "SUCCESS" else ("模拟成功" if status == "SUCCESS_DRY_RUN" else "失败")
+        text = "成功" if status == "SUCCESS" else ("模拟成功" if status == "SUCCESS_DRY_RUN" else ("余额不足" if status == "WAIT_BALANCE" else "失败"))
         reason = (m.group("reason") or "").strip()
         reason = re.sub(r"^\s*wallet_address=[^|]+\|\s*", "", reason)
         item = f"{hhmmss} | 钱包{wallet_seq} | {sell}→{buy} | {text}"
         mm = amount_pat.search(reason)
         gm = gas_pat.search(reason)
-        if "wait_gas" in reason:
+        wb = wait_bal_pat.search(reason)
+        if status == "WAIT_BALANCE" and wb:
+            item += f" | 需要={wb.group(1)} | 余额={wb.group(2)}"
+        elif "wait_gas" in reason:
             gas_txt = gm.group(1) if gm else "-"
             item += f" | gas:{gas_txt}丨等待gas降低中..."
         elif mm:
@@ -417,6 +423,7 @@ def _wallet_history_from_lines_by_address(lines: list[str], address: str, limit:
     )
     amount_pat = re.compile(r"sell_amount=([0-9]+(?:\.[0-9]+)?)\s*\|\s*returned_amount=([0-9]+(?:\.[0-9]+)?)")
     gas_pat = re.compile(r"network_fee=([0-9]+(?:\.[0-9]+)?)")
+    wait_bal_pat = re.compile(r"need=([0-9]+(?:\.[0-9]+)?)\s*\|\s*unlocked=([0-9]+(?:\.[0-9]+)?)")
     addr_pat = re.compile(r"wallet_address=([^|]+)")
     for line in reversed(lines):
         m = pat.search(line)
@@ -435,11 +442,14 @@ def _wallet_history_from_lines_by_address(lines: list[str], address: str, limit:
         sell = "CC" if m.group("sell") == "Amulet" else m.group("sell")
         buy = "CC" if m.group("buy") == "Amulet" else m.group("buy")
         status = m.group("status")
-        text = "成功" if status == "SUCCESS" else ("模拟成功" if status == "SUCCESS_DRY_RUN" else "失败")
+        text = "成功" if status == "SUCCESS" else ("模拟成功" if status == "SUCCESS_DRY_RUN" else ("余额不足" if status == "WAIT_BALANCE" else "失败"))
         item = f"{hhmmss} | 钱包{wallet} | {sell}→{buy} | {text}"
         mm = amount_pat.search(reason)
         gm = gas_pat.search(reason)
-        if "wait_gas" in reason:
+        wb = wait_bal_pat.search(reason)
+        if status == "WAIT_BALANCE" and wb:
+            item += f" | 需要={wb.group(1)} | 余额={wb.group(2)}"
+        elif "wait_gas" in reason:
             gas_txt = gm.group(1) if gm else "-"
             item += f" | gas:{gas_txt}丨等待gas降低中..."
         elif mm:
@@ -847,31 +857,55 @@ HTML = """<!doctype html>
 <style>
 :root { --fg:#e5e7eb; --muted:#94a3b8; --line:#334155; --ok:#16a34a; --warn:#f59e0b; --bad:#dc2626; --pri:#2563eb; }
 *{box-sizing:border-box;font-family:"Segoe UI","PingFang SC",sans-serif;} body{margin:0;color:var(--fg);background:radial-gradient(circle at 20% 10%,#1e293b 0,#0b1220 45%,#070b16 100%);} 
-.wrap{max-width:1120px;margin:20px auto;padding:0 14px 20px;} .grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:14px;align-items:start;} .col{display:flex;flex-direction:column;gap:14px;min-width:0;}
-.card{background:rgba(17,24,39,.92);border:1px solid var(--line);border-radius:14px;padding:12px;width:100%;} h1{margin:0 0 8px;font-size:24px;} h2{margin:0 0 8px;font-size:15px;color:#cbd5e1;} .row{display:grid;grid-template-columns:1fr 1fr;gap:10px;} label{display:block;font-size:12px;color:var(--muted);margin:8px 0 4px;} input,select,textarea{width:100%;background:#020617;color:var(--fg);border:1px solid #334155;border-radius:8px;padding:8px;} textarea{min-height:88px;resize:vertical;} .btns{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap;} button{border:0;padding:8px 12px;border-radius:8px;cursor:pointer;color:#fff;font-weight:600;} .ok{background:var(--ok);} .warn{background:var(--warn);} .bad{background:var(--bad);} .pri{background:var(--pri);} .ghost{background:#1f2937;border:1px solid #475569;color:#e2e8f0;} #status{font-weight:700;} pre{margin:0;background:#020617;border:1px solid #334155;border-radius:8px;padding:10px;height:360px;overflow:auto;white-space:pre-wrap;width:100%;} .wallet-item{display:flex;justify-content:space-between;gap:8px;padding:6px 0;border-bottom:1px dashed #334155;} .tiny{font-size:12px;color:var(--muted);} @media (max-width:900px){.grid{grid-template-columns:1fr;} pre{height:280px;}}
+.wrap{max-width:760px;margin:12px auto;padding:0 4px 12px;} .grid{display:grid;grid-template-columns:minmax(0,0.72fr) minmax(0,1.28fr);gap:4px;align-items:stretch;} .col{display:flex;flex-direction:column;gap:6px;min-width:0;height:100%;}
+.card{background:rgba(17,24,39,.92);border:1px solid var(--line);border-radius:12px;padding:10px;width:100%;} .logs-card{height:100%;display:flex;flex-direction:column;min-height:0;} h1{margin:0 0 6px;font-size:24px;} h2{margin:0 0 6px;font-size:15px;color:#cbd5e1;} .row{display:grid;grid-template-columns:1fr 1fr;gap:8px;} label{display:block;font-size:12px;color:var(--muted);margin:6px 0 4px;} input,select,textarea{width:100%;background:#020617;color:var(--fg);border:1px solid #334155;border-radius:7px;padding:6px;} input:disabled,select:disabled,textarea:disabled{background:#020617;color:#fda4af;border:1px solid #fb5a67;cursor:not-allowed;opacity:1;background-image:repeating-linear-gradient(135deg, rgba(251,90,103,0) 0 8px, rgba(251,90,103,1) 8px 9px, rgba(251,90,103,0) 9px 16px);background-clip:padding-box;} textarea{min-height:76px;resize:vertical;} .btns{display:flex;gap:6px;margin-top:8px;flex-wrap:wrap;} button{border:0;padding:7px 10px;border-radius:7px;cursor:pointer;color:#fff;font-weight:600;} .ok{background:var(--ok);} .warn{background:var(--warn);} .bad{background:var(--bad);} .pri{background:var(--pri);} .ghost{background:#1f2937;border:1px solid #475569;color:#e2e8f0;} .input-suffix{display:grid;grid-template-columns:1fr auto;gap:6px;align-items:center;} .suffix{font-size:12px;color:var(--muted);} #status{font-weight:700;} pre{margin:0;background:#020617;border:1px solid #334155;border-radius:7px;padding:8px;height:360px;overflow:auto;white-space:pre-wrap;width:100%;} .logs-card pre{height:auto;min-height:0;flex:1;} .wallet-item{display:flex;justify-content:space-between;gap:8px;padding:6px 0;border-bottom:1px dashed #334155;} .tiny{font-size:12px;color:var(--muted);} @media (max-width:900px){.wrap{padding:0 6px 14px;} .grid{grid-template-columns:1fr;align-items:start;} pre{height:280px;} .logs-card pre{min-height:0;height:280px;}}
 </style></head>
-<body><div class="wrap"><h1>Cantex 自动交易 <span class="tiny">(2026-04-09-bulk-v2)</span></h1><div class="grid">
-<div class="col">
+<body><div class="wrap"><h1>Cantex 自动交易 <span class="tiny">(2026-04-11-bulk-v28)</span></h1><div class="grid">
+<div class="col" id="left_col">
   <div class="card">
     <h2>运行控制</h2>
     <div>状态：<span id="status">-</span> ｜ 运行实例：<span id="running_count">0</span></div>
     <div><button class="ok" onclick="loadNetworkFee()">获取</button> 当前gas：<span id="network_fee">未获取</span></div>
     <div id="message" style="display:none;"></div>
-    <div class="btns"><button class="ok" onclick="startBot()">启动</button><button class="warn" onclick="pauseBot()">暂停</button><button class="bad" onclick="stopBot()">停止</button><button class="ghost" onclick="refreshAll()">刷新状态</button><button class="ghost" onclick="clearLogs()">清空日志</button></div>
+    <div class="btns"><button id="btn_run_toggle" class="ok" onclick="toggleRun()">启动</button><button id="btn_dry_toggle" class="ok" onclick="toggleDryRun()">测试-开</button><button id="btn_clear_logs" class="ghost" onclick="clearLogs()">清空日志</button></div>
   </div>
-  <div class="card"><h2>交易结果（按钱包）</h2><pre id="logs"></pre></div>
-</div>
-<div class="col">
   <div class="card">
     <h2>策略设置</h2>
-    <div class="row"><div><label>交易对</label><select id="pair_select"></select></div><div><label>交易方向</label><select id="direction"><option value="A_TO_B">A → B</option><option value="B_TO_A">B → A</option></select></div></div>
-    <div class="row"><div><label>交易数量（随机区间）</label><div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;"><input id="sell_amount_min" placeholder="最小值" /><input id="sell_amount_max" placeholder="最大值（可空）" /></div></div><div><label>自动交易次数（max_trades，0=无限）</label><input id="max_trades" /></div></div>
-    <div class="row"><div><label>并发钱包数（concurrent_wallets，0=全部）</label><input id="concurrent_wallets" /></div><div><label>往返交易（roundtrip_enabled）</label><select id="roundtrip_enabled"><option value="false">关闭</option><option value="true">开启</option></select></div></div>
-    <div class="row"><div><label>全仓模式（use_max_balance）</label><select id="use_max_balance"><option value="false">关闭</option><option value="true">开启（按余额MAX）</option></select></div><div><label>演练模式（dry_run）</label><select id="dry_run"><option value="true">开启（不下真实单）</option><option value="false">关闭（真实交易）</option></select></div></div>
-    <div class="row"><div><label>保留数量（reserve_amount）</label><input id="reserve_amount" /></div><div><label>最大网络费（max_network_fee）</label><input id="max_network_fee" /></div></div>
-    <div class="row"><div><label>最大滑点（%）</label><input id="max_price_impact_pct" /></div><div><label>轮询间隔秒（interval_seconds）</label><input id="interval_seconds" /></div></div>
+    <div class="row">
+      <div><label>交易对</label><select id="pair_select"></select></div>
+      <div><label>并发钱包数量</label><input id="concurrent_wallets" /></div>
+    </div>
+    <div class="row">
+      <div><label>交易数量（随机区间）</label><input id="sell_amount_min" placeholder="最小值" /></div>
+      <div><label>&nbsp;</label><input id="sell_amount_max" placeholder="最大值（可空）" /></div>
+    </div>
+    <div class="row">
+      <div><label>交易次数</label><input id="max_trades" placeholder="自动交易次数" /></div>
+      <div><label>往返开关</label><button type="button" id="roundtrip_toggle" class="warn" onclick="toggleRoundtrip()" style="width:100%;">往返-关</button><input type="hidden" id="roundtrip_enabled" value="false" /></div>
+    </div>
+    <div class="row">
+      <div><label>网络费用</label><input id="max_network_fee" placeholder="最大网络费" /></div>
+      <div><label>滑点</label><div class="input-suffix"><input id="max_price_impact_pct" placeholder="最大滑点" /><span class="suffix">%</span></div></div>
+    </div>
+    <div class="row">
+      <div><label>百分比交易</label>
+      <select id="max_balance_pct">
+        <option value="0">关闭</option>
+        <option value="10">10%</option>
+        <option value="25">25%</option>
+        <option value="50">50%</option>
+        <option value="75">75%</option>
+        <option value="100">100%</option>
+      </select>
+      </div>
+      <div><label>保留数量</label><input id="reserve_amount" placeholder="保留数量" /></div>
+    </div>
+    <input type="hidden" id="dry_run" value="true" />
     <div class="btns"><button class="pri" onclick="saveConfig()">保存配置</button><span id="save_notice" class="tiny"></span></div>
   </div>
+</div>
+<div class="col" id="right_col">
+  <div class="card logs-card" id="logs_card"><h2>交易结果（按钱包）</h2><pre id="logs"></pre></div>
 </div>
 </div>
 <div class="card" style="margin-top:14px;">
@@ -885,24 +919,43 @@ HTML = """<!doctype html>
       <button class="bad" onclick="deleteAllWallets()">全删除</button>
     </div>
   </div>
-  <div class="tiny">当前钱包：<span id="wallet_current">无</span></div>
   <div class="tiny">说明：停用后，该钱包不会参与交易。</div>
   <div id="wallet_list"></div>
   <label style="margin-top:12px;">批量添加（每行一个钱包：`操作员私钥 空格/Tab 交易私钥 [空格/Tab 注释]`）</label>
-  <textarea id="wallet_batch" placeholder="op_hex_1 tr_hex_1 主钱包&#10;op_hex_2<TAB>tr_hex_2<TAB>测试钱包"></textarea>
+  <textarea id="wallet_batch" placeholder=""></textarea>
   <div class="btns"><button class="pri" onclick="batchAddWallets()">批量添加钱包</button></div>
 </div>
 </div></div>
 <script>
 let POOLS=[];
+let DIRECTED_PAIRS=[];
 let walletRefreshInFlight=false;
 let walletRetryTimer=null;
 let serverLogText='';
 let uiLocalLogLines=[];
+let configDirty=false;
+let runToggleBusy=false;
 async function jget(url){const r=await fetch(url);return await r.json();}
 async function jpost(url,body){const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});return await r.json();}
 function msg(t){if(t)pushLogLine(t);}
+function setRunControlsEnabled(enabled){['btn_run_toggle','btn_dry_toggle','btn_clear_logs'].forEach(id=>{const el=document.getElementById(id);if(el){el.disabled=!enabled;el.style.opacity=enabled?'1':'0.45';el.style.cursor=enabled?'pointer':'not-allowed';}});}
+function setConfigDirty(flag){configDirty=!!flag;setRunControlsEnabled(!configDirty);if(configDirty){setSaveNotice('配置已修改，请先保存。');}}
+function currentStrategySnapshot(){return JSON.stringify({pair_select:document.getElementById('pair_select')?.value||'',sell_amount_min:document.getElementById('sell_amount_min')?.value||'',sell_amount_max:document.getElementById('sell_amount_max')?.value||'',max_trades:document.getElementById('max_trades')?.value||'',concurrent_wallets:document.getElementById('concurrent_wallets')?.value||'',max_balance_pct:document.getElementById('max_balance_pct')?.value||'',reserve_amount:document.getElementById('reserve_amount')?.value||'',roundtrip_enabled:document.getElementById('roundtrip_enabled')?.value||'',dry_run:document.getElementById('dry_run')?.value||'',max_network_fee:document.getElementById('max_network_fee')?.value||'',max_price_impact_pct:document.getElementById('max_price_impact_pct')?.value||''});}
+function bindStrategyDirtyWatchers(){['pair_select','sell_amount_min','sell_amount_max','max_trades','concurrent_wallets','max_balance_pct','reserve_amount','max_network_fee','max_price_impact_pct'].forEach(id=>{const el=document.getElementById(id);if(!el)return;el.addEventListener('input',()=>setConfigDirty(true));el.addEventListener('change',()=>setConfigDirty(true));});}
+function setRoundtripEnabled(enabled, markDirty=false){const hidden=document.getElementById('roundtrip_enabled');const btn=document.getElementById('roundtrip_toggle');const on=!!enabled;if(hidden){hidden.value=on?'true':'false';}if(btn){btn.textContent=on?'往返-开':'往返-关';btn.classList.remove('ok','warn');btn.classList.add(on?'ok':'warn');}if(markDirty){setConfigDirty(true);}}
+function toggleRoundtrip(){const hidden=document.getElementById('roundtrip_enabled');const cur=(hidden?hidden.value:'false')==='true';setRoundtripEnabled(!cur,true);}
+function setDryRunEnabled(enabled){const hidden=document.getElementById('dry_run');const btn=document.getElementById('btn_dry_toggle');const on=!!enabled;if(hidden){hidden.value=on?'true':'false';}if(btn){btn.textContent=on?'测试-开':'测试-关';btn.classList.remove('ok','warn');btn.classList.add(on?'ok':'warn');}}
+async function toggleDryRun(){if(configDirty){msg('配置已修改，请先保存配置。');return;}const hidden=document.getElementById('dry_run');const cur=(hidden?hidden.value:'true')==='true';setDryRunEnabled(!cur);await saveConfig();}
+function updateRunToggleByStatus(running){const btn=document.getElementById('btn_run_toggle');if(!btn)return;btn.textContent=running?'停止':'启动';btn.classList.remove('ok','bad');btn.classList.add(running?'bad':'ok');}
 function renderLogs(){const el=document.getElementById('logs');if(!el)return;const parts=[];if(uiLocalLogLines.length){parts.push(uiLocalLogLines.join('\\n'));}if(serverLogText){parts.push(serverLogText);}el.textContent=parts.join(parts.length===2?'\\n':'');}
+function syncPanelHeights(){
+  if(window.innerWidth<=900)return;
+  const left=document.getElementById('left_col');
+  const logsCard=document.getElementById('logs_card');
+  if(!left||!logsCard)return;
+  const h=left.offsetHeight;
+  if(h>0){logsCard.style.height=`${h}px`;}
+}
 function pushLogLine(t){if(!t)return;const now=new Date();const hh=String(now.getHours()).padStart(2,'0');const mm=String(now.getMinutes()).padStart(2,'0');const ss=String(now.getSeconds()).padStart(2,'0');const line=`${hh}:${mm}:${ss} | ${t}`;uiLocalLogLines.unshift(line);if(uiLocalLogLines.length>200){uiLocalLogLines=uiLocalLogLines.slice(0,200);}renderLogs();}
 function scheduleWalletRetry(){if(walletRetryTimer)return;walletRetryTimer=setTimeout(async()=>{walletRetryTimer=null;await refreshWalletSnapshots(true);},4000);}
 function setSaveNotice(t){const el=document.getElementById('save_notice');if(!el)return;el.textContent=t||'';if(t){setTimeout(()=>{if(el.textContent===t)el.textContent='';},2500);}}
@@ -922,32 +975,88 @@ try{
   if(typeof onDone==='function'){onDone(!!ok);}
 }catch(e){if(typeof onDone==='function'){onDone(false);}}
 }
-function setStatus(d){const el=document.getElementById('status');el.textContent=d.running?'运行中':'已停止';el.style.color=d.running?'#16a34a':'#f59e0b';document.getElementById('running_count').textContent=d.running_count||0;}
+function setStatus(d){const running=!!(d&&d.running);const el=document.getElementById('status');el.textContent=running?'运行中':'已停止';el.style.color=running?'#16a34a':'#f59e0b';document.getElementById('running_count').textContent=d.running_count||0;updateRunToggleByStatus(running);}
+function setStatusDisconnected(){const el=document.getElementById('status');el.textContent='连接断开';el.style.color='#ef4444';document.getElementById('running_count').textContent='-';}
 function tokenLabel(id){return id==='Amulet'?'CC':id;}
 function pairLabel(p){return `${tokenLabel(p.token_a.id)} <-> ${tokenLabel(p.token_b.id)}`;}
 function instEq(a,b){return a&&b&&a.id===b.id&&a.admin===b.admin;}
-function fillPools(pools){POOLS=pools||[];const sel=document.getElementById('pair_select');sel.innerHTML='';for(let i=0;i<POOLS.length;i++){const o=document.createElement('option');o.value=String(i);o.textContent=pairLabel(POOLS[i]);sel.appendChild(o);}}
+function findInstInPools(tokenId){
+  for(const p of POOLS){
+    if(p?.token_a?.id===tokenId)return p.token_a;
+    if(p?.token_b?.id===tokenId)return p.token_b;
+  }
+  return null;
+}
+function hasPairInPools(tokenA, tokenB){
+  for(const p of POOLS){
+    const a=p?.token_a, b=p?.token_b;
+    if((a?.id===tokenA&&b?.id===tokenB)||(a?.id===tokenB&&b?.id===tokenA))return true;
+  }
+  return false;
+}
+function fillPools(pools){
+  POOLS=pools||[];
+  DIRECTED_PAIRS=[];
+  const candidates=[
+    {label:'CC→USDX',sellId:'Amulet',buyId:'USDCx'},
+    {label:'USDX→CC',sellId:'USDCx',buyId:'Amulet'},
+    {label:'CC→CBTC',sellId:'Amulet',buyId:'CBTC'},
+    {label:'CBTC→CC',sellId:'CBTC',buyId:'Amulet'}
+  ];
+  for(const c of candidates){
+    if(!hasPairInPools(c.sellId,c.buyId))continue;
+    const sellInst=findInstInPools(c.sellId);
+    const buyInst=findInstInPools(c.buyId);
+    if(!sellInst||!buyInst)continue;
+    DIRECTED_PAIRS.push({label:c.label,sell:sellInst,buy:buyInst});
+  }
+  const sel=document.getElementById('pair_select');
+  sel.innerHTML='';
+  for(let i=0;i<DIRECTED_PAIRS.length;i++){
+    const o=document.createElement('option');
+    o.value=String(i);
+    o.textContent=DIRECTED_PAIRS[i].label;
+    sel.appendChild(o);
+  }
+}
+function syncAmountInputsByPct(){
+  const pctSel=document.getElementById('max_balance_pct');
+  const minEl=document.getElementById('sell_amount_min');
+  const maxEl=document.getElementById('sell_amount_max');
+  const on=(pctSel && String(pctSel.value||'0')!=='0');
+  if(minEl){
+    minEl.disabled=!!on;
+    minEl.placeholder=on?'禁用':'最小值';
+  }
+  if(maxEl){
+    maxEl.disabled=!!on;
+    maxEl.placeholder=on?'禁用':'最大值（可空）';
+  }
+}
 function syncFromConfig(cfg){
-  document.getElementById('dry_run').value=String(!!cfg.trade.dry_run);
-  document.getElementById('roundtrip_enabled').value=String(!!cfg.trade.roundtrip_enabled);
-  document.getElementById('interval_seconds').value=cfg.loop.interval_seconds??15;
+  setDryRunEnabled(!!cfg.trade.dry_run);
+  setRoundtripEnabled(!!cfg.trade.roundtrip_enabled,false);
   document.getElementById('max_network_fee').value=cfg.trade.max_network_fee??'1';
   document.getElementById('max_price_impact_pct').value=((Number(cfg.trade.max_price_impact_bps??200))/100).toString();
   const baseAmt=(cfg.trade.quote_params&&cfg.trade.quote_params.sell_amount)?cfg.trade.quote_params.sell_amount:'1';
   document.getElementById('sell_amount_min').value=(cfg.trade.sell_amount_min??baseAmt);
   document.getElementById('sell_amount_max').value=(cfg.trade.sell_amount_max??'');
-  document.getElementById('max_trades').value=cfg.trade.max_trades??0;
-  document.getElementById('concurrent_wallets').value=cfg.trade.concurrent_wallets??0;
-  document.getElementById('use_max_balance').value=String(!!cfg.trade.use_max_balance);
+  document.getElementById('max_trades').value=cfg.trade.max_trades??1;
+  document.getElementById('concurrent_wallets').value=cfg.trade.concurrent_wallets??1;
+  const pctRaw=Number(cfg.trade.max_balance_pct ?? (cfg.trade.use_max_balance ? 100 : 0));
+  const pctAllowed=[0,10,25,50,75,100];
+  const pct = pctAllowed.includes(pctRaw) ? pctRaw : 100;
+  document.getElementById('max_balance_pct').value=String(pct);
+  syncAmountInputsByPct();
   document.getElementById('reserve_amount').value=cfg.trade.reserve_amount??'0';
   const s=cfg.trade.quote_params.sell_instrument,b=cfg.trade.quote_params.buy_instrument;
   let found=false;
-  for(let i=0;i<POOLS.length;i++){
-    const p=POOLS[i];
-    if(instEq(s,p.token_a)&&instEq(b,p.token_b)){document.getElementById('pair_select').value=String(i);document.getElementById('direction').value='A_TO_B';found=true;break;}
-    if(instEq(s,p.token_b)&&instEq(b,p.token_a)){document.getElementById('pair_select').value=String(i);document.getElementById('direction').value='B_TO_A';found=true;break;}
+  for(let i=0;i<DIRECTED_PAIRS.length;i++){
+    const p=DIRECTED_PAIRS[i];
+    if(instEq(s,p.sell)&&instEq(b,p.buy)){document.getElementById('pair_select').value=String(i);found=true;break;}
   }
-  if(!found&&POOLS.length>0){document.getElementById('pair_select').value='0';}
+  if(!found&&DIRECTED_PAIRS.length>0){document.getElementById('pair_select').value='0';}
+  setConfigDirty(false);
 }
 async function loadConfig(){const d=await jget('/api/config');if(!d.ok){msg(d.message);return null;}return d.config;}
 async function loadPools(){const d=await jget('/api/pools');if(!d.ok){msg(d.message);return;}fillPools(d.pools);const cfg=await loadConfig();if(cfg)syncFromConfig(cfg);}
@@ -956,21 +1065,22 @@ async function saveConfig(){
     const cfgRes=await jget('/api/config');
     if(!cfgRes.ok){msg(cfgRes.message);return;}
     const cfg=cfgRes.config;
-    if(!POOLS.length){msg('没有可用交易对，请检查网络后刷新页面。');return;}
+    if(!DIRECTED_PAIRS.length){msg('没有可用交易对，请检查网络后刷新页面。');return;}
     const idx=Number(document.getElementById('pair_select').value||0);
-    const dir=document.getElementById('direction').value;
-    const pair=POOLS[idx];
-    const sell=dir==='A_TO_B'?pair.token_a:pair.token_b;
-    const buy=dir==='A_TO_B'?pair.token_b:pair.token_a;
+    const pair=DIRECTED_PAIRS[idx];
+    if(!pair){msg('交易对无效，请重新选择。');return;}
+    const sell=pair.sell;
+    const buy=pair.buy;
     const amountMin=String(document.getElementById('sell_amount_min').value||'1');
     const amountMaxRaw=String(document.getElementById('sell_amount_max').value||'').trim();
     cfg.trade.dry_run=document.getElementById('dry_run').value==='true';
     cfg.trade.roundtrip_enabled=document.getElementById('roundtrip_enabled').value==='true';
-    cfg.trade.max_trades=Number(document.getElementById('max_trades').value||0);
-    cfg.trade.concurrent_wallets=Number(document.getElementById('concurrent_wallets').value||0);
-    cfg.trade.use_max_balance=document.getElementById('use_max_balance').value==='true';
+    cfg.trade.max_trades=Number(document.getElementById('max_trades').value||1);
+    cfg.trade.concurrent_wallets=Math.max(1,Number(document.getElementById('concurrent_wallets').value||1));
+    cfg.trade.max_balance_pct=Number(document.getElementById('max_balance_pct').value||100);
+    cfg.trade.use_max_balance=cfg.trade.max_balance_pct>0;
     cfg.trade.reserve_amount=String(document.getElementById('reserve_amount').value||'0');
-    cfg.loop.interval_seconds=Number(document.getElementById('interval_seconds').value||15);
+    cfg.loop.interval_seconds=5;
     cfg.trade.max_network_fee=String(document.getElementById('max_network_fee').value||'1');
     cfg.trade.max_price_impact_bps=Math.round((Number(document.getElementById('max_price_impact_pct').value||'2'))*100);
     cfg.trade.sell_amount_min=amountMin;
@@ -982,19 +1092,44 @@ async function saveConfig(){
     cfg.trade.swap_params.sell_instrument=sell;
     cfg.trade.swap_params.buy_instrument=buy;
     const r=await jpost('/api/config',cfg);
-    if(r.ok){setSaveNotice('配置已保存。');msg('');}else{msg(r.message||'保存失败');}
+    if(r.ok){setConfigDirty(false);setSaveNotice('配置已保存。');msg('');}else{msg(r.message||'保存失败');}
   }catch(e){msg('保存失败：'+e);}
 }
-async function loadStatus(){const d=await jget('/api/status');setStatus(d);} 
+async function loadStatus(){try{const d=await jget('/api/status');setStatus(d);}catch(_e){setStatusDisconnected();}} 
 async function loadNetworkFee(){const d=await jget('/api/gas');if(!d.ok){document.getElementById('network_fee').textContent='读取失败';msg(d.message||'读取网络费失败');return;}document.getElementById('network_fee').textContent=d.latest_network_fee||'待获取';}
 async function loadLogs(){const d=await jget('/api/logs');serverLogText=d.logs||'';renderLogs();}
-async function clearLogs(){await jpost('/api/logs/clear',{});uiLocalLogLines=[];await loadLogs();}
-async function startBot(){await jpost('/api/logs/clear',{});await jpost('/api/start',{});await refreshAll();}
-async function pauseBot(){await jpost('/api/pause',{});await refreshAll();}
-async function stopBot(){await jpost('/api/stop',{});await refreshAll();}
+async function clearLogs(){if(configDirty){msg('配置已修改，请先保存配置。');return;}await jpost('/api/logs/clear',{});uiLocalLogLines=[];await loadLogs();}
+async function toggleRun(){
+  if(configDirty){msg('配置已修改，请先保存配置。');return;}
+  if(runToggleBusy){return;}
+  runToggleBusy=true;
+  const btn=document.getElementById('btn_run_toggle');
+  const prevText=btn?btn.textContent:'';
+  if(btn){btn.disabled=true;btn.textContent='处理中...';}
+  try{
+    const st=await jget('/api/status');
+    let r=null;
+    if(st&&st.running){
+      r=await jpost('/api/stop',{});
+    }else{
+      await jpost('/api/logs/clear',{});
+      uiLocalLogLines=[];
+      r=await jpost('/api/start',{});
+    }
+  }catch(e){
+    msg('启动/停止请求失败：'+e);
+  }finally{
+    if(btn){
+      btn.textContent=prevText||btn.textContent;
+      btn.disabled=configDirty;
+    }
+    setTimeout(()=>{runToggleBusy=false;},900);
+  }
+  await refreshAll();
+}
 async function viewWalletHistory(seq){const d=await jget(`/api/wallets/history?seq=${encodeURIComponent(String(seq))}&limit=20`);const el=document.getElementById('wallet_history');if(!el)return;el.textContent=d&&d.ok?(d.history||`钱包${seq} 暂无交易记录。`):(d.message||'查询失败');}
 async function queryHistoryByAddress(){const raw=prompt('请输入钱包地址（完整地址）');if(raw===null)return;const address=String(raw||'').trim();if(!address){msg('请输入有效钱包地址。');return;}const d=await jget(`/api/wallets/history_by_address?address=${encodeURIComponent(address)}&limit=20`);const text=d&&d.ok?(d.history||'暂无交易记录。'):(d.message||'查询失败');alert(text);}
-async function loadWallets(){const d=await jget('/api/wallets');const box=document.getElementById('wallet_list');const cur=document.getElementById('wallet_current');if(!d.ok){box.textContent=d.message||'读取钱包失败';cur.textContent='读取失败';return;}if(!d.wallets.length){box.innerHTML='<div class="tiny">当前未配置钱包，将使用 .env 默认密钥。</div>';cur.textContent='无（使用 .env 默认）';return;}box.innerHTML='';const active=d.wallets.filter(w=>!w.disabled).map(w=>w.display_name);const paused=d.wallets.filter(w=>w.disabled).map(w=>w.display_name);cur.textContent=`启用: ${active.length?active.join('、'):'无'}；停用: ${paused.length?paused.join('、'):'无'}`;let hasRefreshError=false;for(const w of d.wallets){const row=document.createElement('div');row.className='wallet-item';const comment=w.comment?` | 备注: ${w.comment}`:'';const err=w.refresh_error?` | 获取失败，自动重试中`:'';
+async function loadWallets(){const d=await jget('/api/wallets');const box=document.getElementById('wallet_list');if(!d.ok){box.textContent=d.message||'读取钱包失败';return;}if(!d.wallets.length){box.innerHTML='<div class="tiny">当前未配置钱包，将使用 .env 默认密钥。</div>';return;}box.innerHTML='';let hasRefreshError=false;for(const w of d.wallets){const row=document.createElement('div');row.className='wallet-item';const comment=w.comment?` | 备注: ${w.comment}`:'';const err=w.refresh_error?` | 获取失败，自动重试中`:''; 
 if(w.refresh_error){hasRefreshError=true;}
 const addr=w.address_short||'-';const bal=w.balances||{};row.innerHTML=`<div><div>${w.display_name}</div><div class="tiny">地址: ${addr} | 余额 CC:${fmtAmt(bal.CC)} USDC:${fmtAmt(bal.USDC)} CBTC:${fmtAmt(bal.CBTC)}${comment}${err}</div><div class="tiny">operator: ${w.operator_key_mask} | trading: ${w.trading_key_mask}</div></div>`;const tools=document.createElement('div');tools.style.display='flex';tools.style.gap='6px';tools.style.alignItems='center';const cpbtn=document.createElement('button');cpbtn.className='ghost';cpbtn.textContent='复制地址';const cpnote=document.createElement('span');cpnote.className='tiny';cpnote.style.minWidth='42px';cpnote.textContent='';cpbtn.onclick=()=>copyText(w.address||'',(ok)=>{cpnote.textContent=ok?'已复制':'复制失败';setTimeout(()=>{cpnote.textContent='';},1800);});const cbtn=document.createElement('button');cbtn.className=w.disabled?'warn':'ok';cbtn.textContent=w.disabled?'已停用':'已启用';cbtn.onclick=()=>setWalletDisabled(w.id,!w.disabled);const dbtn=document.createElement('button');dbtn.className='bad';dbtn.textContent='删除';dbtn.onclick=()=>deleteWallet(w.id);tools.appendChild(cpnote);tools.appendChild(cpbtn);tools.appendChild(cbtn);tools.appendChild(dbtn);row.appendChild(tools);box.appendChild(row);} if(hasRefreshError){scheduleWalletRetry();}}
 async function batchAddWallets(){const text=document.getElementById('wallet_batch').value.trim();if(!text){msg('请先粘贴批量钱包内容。');return;}const r=await jpost('/api/wallets/batch_add',{text});msg(r.message||'');if(r.ok){document.getElementById('wallet_batch').value='';await loadWallets();await refreshWalletSnapshots();}}
@@ -1004,7 +1139,10 @@ async function setAllWalletDisabled(toDisabled){const r=await jpost('/api/wallet
 async function deleteAllWallets(){if(!confirm('确认删除全部钱包？此操作不可恢复。'))return;const r=await jpost('/api/wallets/delete_all',{});if(r&&r.message)pushLogLine(r.message);await loadWallets();}
 async function refreshWalletSnapshots(silent=false){if(walletRefreshInFlight)return;walletRefreshInFlight=true;try{const r=await jget('/api/wallets/refresh');if(!silent){msg(r.message||'');}await loadWallets();}finally{walletRefreshInFlight=false;}}
 async function refreshAll(){await Promise.all([loadStatus(),loadLogs()]);}
-loadPools();loadWallets();refreshAll();setTimeout(()=>refreshWalletSnapshots(true),500);setInterval(refreshAll,3000);setInterval(()=>refreshWalletSnapshots(true),30000);
+loadPools();loadWallets();refreshAll();bindStrategyDirtyWatchers();setRunControlsEnabled(true);const pctSelBoot=document.getElementById('max_balance_pct');if(pctSelBoot){pctSelBoot.addEventListener('change',syncAmountInputsByPct);pctSelBoot.addEventListener('input',syncAmountInputsByPct);}syncAmountInputsByPct();setTimeout(()=>refreshWalletSnapshots(true),500);setInterval(refreshAll,3000);setInterval(()=>refreshWalletSnapshots(true),30000);
+window.addEventListener('load',syncPanelHeights);
+window.addEventListener('resize',syncPanelHeights);
+setInterval(syncPanelHeights,250);
 </script></body></html>"""
 
 

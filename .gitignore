@@ -12,3 +12,5 @@ secrets/
 log_archive/
 runtime_gas_gate.json
 runtime_gas_gate.lock
+runtime_trade_slots/
+pip_bip_install.log
